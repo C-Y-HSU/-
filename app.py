@@ -144,7 +144,7 @@ def save_event_data(event_name, full_df):
 df_logs = load_data()
 df_residents = load_residents()
 
-#建立對應字典，方便從身分證查出房床號
+# 建立對應字典，方便從身分證查出房床號
 resident_room_map = {}
 if not df_residents.empty:
   for _, r in df_residents.iterrows():
@@ -372,8 +372,9 @@ if not df_current_event.empty:
   st.dataframe(df_display, use_container_width=True)
 
   # ------------------------------------------
-  # 新增功能：一鍵下載 Word 通報單
+  # 獨立區塊：一鍵下載 Word 通報單
   # ------------------------------------------
+  st.markdown("---")
   st.markdown("#### 📄 匯出正式 Word 通報單")
   report_options = {}
   for local_num, (idx, row) in enumerate(df_current_event.iterrows(), start=1):
@@ -386,12 +387,11 @@ if not df_current_event.empty:
       key="report_select",
   )
 
-  if st.button("📥 下載此個案的 Word 通報單"):
+  if st.button("📥 點擊生成此個案的 Word 通報單"):
     row_data = report_options[selected_report_label]
     id_upper = str(row_data["身份證字號"]).strip().upper()
     room_no = resident_room_map.get(id_upper, "未建檔房號")
 
-    # 準備填入 Word 範本的變數字典
     context = {
         "姓名": str(row_data["姓名"]),
         "房床號": room_no,
@@ -404,23 +404,25 @@ if not df_current_event.empty:
 
     template_path = "template.docx"
     if os.path.exists(template_path):
-      doc = DocxTemplate(template_path)
-      doc.render(context)
+      try:
+        doc = DocxTemplate(template_path)
+        doc.render(context)
 
-      # 儲存至記憶體中供下載
-      file_stream = io.BytesIO()
-      doc.save(file_stream)
-      file_stream.seek(0)
+        file_stream = io.BytesIO()
+        doc.save(file_stream)
+        file_stream.seek(0)
 
-      st.download_button(
-          label=f"💾 點擊下載 【{row_data['姓名']}】 的通報單.docx",
-          data=file_stream,
-          file_name=f"通報單_{row_data['姓名']}_{row_data['身份證字號']}.docx",
-          mime=(
-              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          ),
-      )
-      st.success("✅ 通報單已成功生成，請點擊上方按鈕下載！")
+        st.download_button(
+            label=f"💾 下載 【{row_data['姓名']}】 的正式通報單.docx",
+            data=file_stream,
+            file_name=f"通報單_{row_data['姓名']}_{row_data['身份證字號']}.docx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+        )
+        st.success("✅ 通報單已成功生成，請點擊上方出現的下載按鈕！")
+      except Exception as e:
+        st.error(f"⚠️ 生成 Word 檔案時發生錯誤：{e}")
     else:
       st.error(
           "⚠️ 找不到 Word 範本檔案 (`template.docx`)，請確認是否已經上傳至 GitHub"
