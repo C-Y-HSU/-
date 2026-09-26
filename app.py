@@ -1,109 +1,556 @@
-import streamlit as st
-import openpyxl
-import pandas as pd
-import tempfile
+from datetime import datetime
+import io
 import os
+from docxtpl import DocxTemplate
+from google.oauth2.service_account import Credentials
+import gspread
+import pandas as pd
+import streamlit as st
 
-# 1. 網頁標題與選單設定
-st.set_page_config(page_title="浩然敬老院 - 院民人日數自動化工具", page_icon="🏥", layout="wide")
+st.title("🏥 群聚事件管理系統 - 雲端多事件與通報單生成")
+st.write(
+    "支援住民資料庫、智慧帶入、雲端分頁同步，以及一鍵生成正式 Word 通報單功能。"
+)
 
-st.title("🏥 浩然敬老院 - 院民人日數自動化分析系統")
-st.markdown("請在左側輸入統計月份並上傳每日報表（如 `0601.xlsx` ~ `0630.xlsx`），系統將自動計算各區人數與全月總人日數。")
+# 定義群聚事件日誌的標準欄位順序
+DESIRED_COLS = [
+    "事件名稱",
+    "事件狀態",
+    "指標個案",
+    "發生日期",
+    "姓名",
+    "性別",
+    "生日",
+    "身份證字號",
+    "確診管道",
+    "後續處理",
+    "記錄時間",
+]
 
-# 2. 側邊欄控制區
-with st.sidebar:
-    st.header("📌 設定與檔案上傳")
-    month_num = st.number_input("統計月份 (1~12)", min_value=1, max_value=12, value=6, step=1)
-    uploaded_files = st.file_uploader(
-        "📁 選擇/拖曳多個每日報表 (.xlsx)", 
-        type=["xlsx"], 
-        accept_multiple_files=True
+# 定義住民基本資料庫的欄位順序
+RESIDENT_COLS = ["姓名", "房床號", "身份證字號", "出生日期", "入住日期"]
+
+
+# ==========================================
+# 雲端資料庫連線與讀寫函數
+# ==========================================
+@st.cache_resource
+def init_google_spreadsheet():
+  creds_dict = dict(st.secrets["gcp_service_account"])
+  scope = [
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive",
+  ]
+  creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+  client = gspread.authorize(creds)
+
+  sheet_id = "16EGDmPEQnhjhYrJ3Y5Afc-s1ByM3Va7eHkBlCXSIBUU"
+  return client.open_by_key(sheet_id)
+
+
+def load_residents():
+  try:
+    spreadsheet = init_google_spreadsheet()
+    try:
+      sheet = spreadsheet.worksheet("住民基本資料")
+    except gspread.exceptions.WorksheetNotFound:
+      sheet = spreadsheet.add_worksheet(
+          title="住民基本資料", rows=100, cols=10
+      )
+      sheet.update([RESIDENT_COLS])
+
+    data = sheet.get_all_records()
+    if not data:
+      return pd.DataFrame(columns=RESIDENT_COLS)
+    df = pd.DataFrame(data)
+    for col in RESIDENT_COLS:
+      if col not in df.columns:
+        df[col] = ""
+    return df
+  except Exception as e:
+    return pd.DataFrame(columns=RESIDENT_COLS)
+
+
+def save_residents(df_res):
+  spreadsheet = init_google_spreadsheet()
+  try:
+    sheet = spreadsheet.worksheet("住民基本資料")
+  except gspread.exceptions.WorksheetNotFound:
+    sheet = spreadsheet.add_worksheet(title="住民基本資料", rows=100, cols=10)
+
+  sheet.clear()
+  existing_cols = [col for col in RESIDENT_COLS if col in df_res.columns]
+  df_res = df_res[existing_cols]
+  sheet.update([df_res.columns.values.tolist()] + df_res.values.tolist())
+
+
+def load_data():
+  try:
+    spreadsheet = init_google_spreadsheet()
+    sheets = spreadsheet.worksheets()
+    all_dfs = []
+
+    for sheet in sheets:
+      if sheet.title == "住民基本資料":
+        continue
+      data = sheet.get_all_records()
+      if data:
+        df = pd.DataFrame(data)
+        df["事件名稱"] = sheet.title
+        all_dfs.append(df)
+
+    if not all_dfs:
+      return pd.DataFrame(columns=DESIRED_COLS)
+
+    df_logs = pd.concat(all_dfs, ignore_index=True)
+
+    for col in DESIRED_COLS:
+      if col not in df_logs.columns:
+        df_logs[col] = ""
+
+    df_logs["事件名稱"] = df_logs["事件名稱"].fillna("未命名群聚事件").astype(str)
+    df_logs["事件狀態"] = df_logs["事件狀態"].fillna("進行中").astype(str)
+    df_logs["指標個案"] = df_logs["指標個案"].fillna("").astype(str)
+
+    existing_cols = [col for col in DESIRED_COLS if col in df_logs.columns]
+    other_cols = [col for col in df_logs.columns if col not in DESIRED_COLS]
+    return df_logs[existing_cols + other_cols]
+
+  except Exception as e:
+    st.error(f"⚠️ 無法讀取 Google 試算表，錯誤原因：{e}")
+    return pd.DataFrame(columns=DESIRED_COLS)
+
+
+def save_event_data(event_name, full_df):
+  spreadsheet = init_google_spreadsheet()
+  df_event = full_df[full_df["事件名稱"] == event_name]
+
+  try:
+    sheet = spreadsheet.worksheet(event_name)
+  except gspread.exceptions.WorksheetNotFound:
+    sheet = spreadsheet.add_worksheet(title=event_name, rows=100, cols=20)
+
+  sheet.clear()
+  if not df_event.empty:
+    existing_cols = [col for col in DESIRED_COLS if col in df_event.columns]
+    df_event = df_event[existing_cols]
+    sheet.update(
+        [df_event.columns.values.tolist()] + df_event.values.tolist()
     )
-    btn_calculate = st.button("🚀 開始自動化分析", type="primary")
+  else:
+    sheet.update([DESIRED_COLS])
 
-# 3. 核心計算邏輯
-if btn_calculate:
-    if not uploaded_files:
-        st.warning("⚠️ 請先上傳每日報表 Excel 檔案！")
+
+df_logs = load_data()
+df_residents = load_residents()
+
+#建立對應字典，方便從身分證查出房床號
+resident_room_map = {}
+if not df_residents.empty:
+  for _, r in df_residents.iterrows():
+    id_key = str(r.get("身份證字號", "")).strip().upper()
+    room_val = str(r.get("房床號", "")).strip()
+    if id_key:
+      resident_room_map[id_key] = room_val
+
+# ==========================================
+# 側邊欄：事件管理與住民資料庫維護
+# ==========================================
+st.sidebar.header("📁 事件管理與結案中心")
+
+if not df_logs.empty and "事件名稱" in df_logs.columns:
+  event_status_map = (
+      df_logs.drop_duplicates(subset=["事件名稱"])
+      .set_index("事件名稱")["事件狀態"]
+      .to_dict()
+  )
+else:
+  event_status_map = {}
+
+all_events = list(event_status_map.keys())
+active_events = [
+    e for e, status in event_status_map.items() if status != "已結案"
+]
+closed_events = [
+    e for e, status in event_status_map.items() if status == "已結案"
+]
+
+event_mode = st.sidebar.radio("請選擇操作模式", ["進行中事件", "新增並切換新事件"])
+
+selected_event = ""
+if event_mode == "進行中事件":
+  view_closed = st.sidebar.checkbox("📂 顯示已結案的歷史事件")
+  target_list = (
+      (active_events + closed_events) if view_closed else active_events
+  )
+
+  if target_list:
+    selected_event = st.sidebar.selectbox("選擇要處理的事件", target_list)
+  else:
+    selected_event = st.sidebar.text_input(
+        "目前無進行中事件，請輸入新事件名稱", "預設群聚事件"
+    )
+else:
+  selected_event = st.sidebar.text_input("輸入新事件名稱（例如：A機構群聚）", "")
+
+if not selected_event:
+  selected_event = "未命名群聚事件"
+
+current_status = event_status_map.get(selected_event, "進行中")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**📌 目前選定事件：**\n### `{selected_event}`")
+if current_status == "已結案":
+  st.sidebar.error("🔒 狀態：此事件已結案（唯獨封存）")
+else:
+  st.sidebar.success("🔥 狀態：進行中")
+
+if not df_logs.empty and selected_event in event_status_map:
+  st.sidebar.markdown("---")
+  if current_status == "進行中":
+    if st.sidebar.button("🔒 將此事件標記為結案"):
+      df_logs.loc[df_logs["事件名稱"] == selected_event, "事件狀態"] = "已結案"
+      save_event_data(selected_event, df_logs)
+      st.sidebar.success("已成功將此事件結案並同步至專屬分頁！")
+      st.rerun()
+  else:
+    if st.sidebar.button("🔓 重新啟動此事件"):
+      df_logs.loc[df_logs["事件名稱"] == selected_event, "事件狀態"] = "進行中"
+      save_event_data(selected_event, df_logs)
+      st.sidebar.success("已成功重新啟動此事件！")
+      st.rerun()
+
+with st.sidebar.expander("👥 管理機構住民基本資料庫"):
+  st.write("依序維護：姓名、房床號、身分證字號、出生日期、入住日期")
+  edited_res_df = st.data_editor(
+      df_residents,
+      num_rows="dynamic",
+      use_container_width=True,
+      key="resident_editor",
+  )
+  if st.button("💾 儲存住民名冊至雲端"):
+    save_residents(edited_res_df)
+    st.success("✨ 住民基本資料已成功更新！")
+    st.rerun()
+
+if not df_logs.empty and "事件名稱" in df_logs.columns:
+  df_current_event = df_logs[df_logs["事件名稱"] == selected_event].copy()
+
+  if not df_current_event.empty and "指標個案" in df_current_event.columns:
+    df_current_event["_temp_sort"] = df_current_event[
+        "指標個案"
+    ].str.contains("指標個案", na=False)
+    df_current_event = df_current_event.sort_values(
+        by="_temp_sort", ascending=False
+    ).drop(columns=["_temp_sort"])
+else:
+  df_current_event = pd.DataFrame(columns=DESIRED_COLS)
+
+
+# ==========================================
+# 醒目功能：顯示當前事件的「指標個案英雄卡片」
+# ==========================================
+st.markdown("---")
+if not df_current_event.empty and "指標個案" in df_current_event.columns:
+  index_cases = df_current_event[
+      df_current_event["指標個案"].str.contains("指標個案", na=False)
+  ]
+
+  if not index_cases.empty:
+    ic = index_cases.iloc[0]
+    st.success(
+        f"### 🌟 【{selected_event}】之官方認定指標個案\n"
+        f"- **姓名**：{ic['姓名']} （性別：{ic['性別']}）\n"
+        f"- **身分證字號**：{ic['身份證字號']}\n"
+        f"- **發生日期**：{ic['發生日期']} | **確診管道**：{ic['確診管道']}\n"
+        f"- **後續處理**：{ic['後續處理']}"
+    )
+  else:
+    st.info(
+        f"💡 提示：目前事件【{selected_event}】尚未指定指標個案，請於下方清單中選取。"
+    )
+
+
+# ==========================================
+# 主畫面 1：新增個案
+# ==========================================
+if current_status == "已結案":
+  st.warning(
+      "🔒 此事件目前為【已結案】狀態，若需新增或修改個案，請先至側邊欄點擊「"
+      "重新啟動此事件」。"
+  )
+else:
+  st.subheader(f"📝 新增確診者（事件：{selected_event}）")
+
+  selected_resident_key = "-- 手動輸入 / 不從名冊帶入 --"
+  if not df_residents.empty:
+    resident_options = {
+        f"[{r.get('房床號', '無房號')}] {r['姓名']} ({r['身份證字號']})": r
+        for _, r in df_residents.iterrows()
+        if str(r.get("姓名", "")).strip()
+    }
+    if resident_options:
+      selected_resident_key = st.selectbox(
+          "🔍 【智慧搜尋帶入】輸入房號、姓名或身分證字號關鍵字篩選住民",
+          ["-- 手動輸入 / 不從名冊帶入 --"] + list(resident_options.keys()),
+      )
+
+  default_name = ""
+  default_birthday = ""
+  default_id = ""
+
+  if selected_resident_key != "-- 手動輸入 / 不從名冊帶入 --":
+    res_data = resident_options[selected_resident_key]
+    default_name = str(res_data.get("姓名", ""))
+    default_birthday = str(res_data.get("出生日期", ""))
+    default_id = str(res_data.get("身份證字號", ""))
+
+  with st.form("case_form"):
+    case_date = st.date_input("1. 發生日期", value=datetime.today())
+
+    col1, col2 = st.columns(2)
+    with col1:
+      name = st.text_input("2. 姓名", value=default_name)
+      gender = st.selectbox("3. 性別", ["男", "女", "其他"])
+
+    with col2:
+      birthday = st.text_input(
+          "4. 生日／出生日期",
+          value=default_birthday,
+          placeholder="例如：1991-03-08",
+      )
+      id_number = st.text_input(
+          "5. 身份證字號", value=default_id, placeholder="例如：A123456789"
+      )
+
+    diagnosis_method = st.text_input(
+        "6. 確診管道（例如：快篩陽性、發燒就醫、PCR）"
+    )
+    follow_up_action = st.text_area(
+        "7. 後續處理（例如：安排單人隔離、通報疾管科）"
+    )
+
+    submitted = st.form_submit_button("送出並記錄個案日誌")
+
+    if submitted:
+      if not name or not id_number:
+        st.warning("⚠️ 請務必填寫「姓名」與「身份證字號」！")
+      else:
+        now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        new_data = pd.DataFrame([{
+            "事件名稱": selected_event,
+            "事件狀態": "進行中",
+            "指標個案": "",
+            "發生日期": str(case_date),
+            "姓名": name,
+            "性別": gender,
+            "生日": birthday,
+            "身份證字號": id_number.upper(),
+            "確診管道": diagnosis_method,
+            "後續處理": follow_up_action,
+            "記錄時間": now_time,
+        }])
+
+        df_logs = pd.concat([df_logs, new_data], ignore_index=True)
+        save_event_data(selected_event, df_logs)
+        st.success(
+            f"🎉 成功將確診者【{name}】記錄至雲端分頁【{selected_event}】！"
+        )
+        st.rerun()
+
+
+# ==========================================
+# 主畫面 2：目前事件的總日誌表格與通報單生成
+# ==========================================
+st.markdown("---")
+st.subheader(f"📋 【{selected_event}】目前的確診個案總日誌")
+
+if not df_current_event.empty:
+  df_display = df_current_event.reset_index(drop=True).copy()
+  df_display.index = df_display.index + 1
+  st.dataframe(df_display, use_container_width=True)
+
+  # ------------------------------------------
+  # 新增功能：一鍵下載 Word 通報單
+  # ------------------------------------------
+  st.markdown("#### 📄 匯出正式 Word 通報單")
+  report_options = {}
+  for local_num, (idx, row) in enumerate(df_current_event.iterrows(), start=1):
+    label = f"個案編號 {local_num}：{row['姓名']} ({row['身份證字號']})"
+    report_options[label] = row
+
+  selected_report_label = st.selectbox(
+      "選擇要生成 Word 通報單的個案",
+      list(report_options.keys()),
+      key="report_select",
+  )
+
+  if st.button("📥 下載此個案的 Word 通報單"):
+    row_data = report_options[selected_report_label]
+    id_upper = str(row_data["身份證字號"]).strip().upper()
+    room_no = resident_room_map.get(id_upper, "未建檔房號")
+
+    # 準備填入 Word 範本的變數字典
+    context = {
+        "姓名": str(row_data["姓名"]),
+        "房床號": room_no,
+        "身份證字號": str(row_data["身份證字號"]),
+        "生日": str(row_data["生日"]),
+        "發生日期": str(row_data["發生日期"]),
+        "確診管道": str(row_data["確診管道"]),
+        "後續處理": str(row_data["後續處理"]),
+    }
+
+    template_path = "template.docx"
+    if os.path.exists(template_path):
+      doc = DocxTemplate(template_path)
+      doc.render(context)
+
+      # 儲存至記憶體中供下載
+      file_stream = io.BytesIO()
+      doc.save(file_stream)
+      file_stream.seek(0)
+
+      st.download_button(
+          label=f"💾 點擊下載 【{row_data['姓名']}】 的通報單.docx",
+          data=file_stream,
+          file_name=f"通報單_{row_data['姓名']}_{row_data['身份證字號']}.docx",
+          mime=(
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          ),
+      )
+      st.success("✅ 通報單已成功生成，請點擊上方按鈕下載！")
     else:
-        target_cols = ['E', 'F', 'G', 'I', 'J', 'M', 'N', 'O']
+      st.error(
+          "⚠️ 找不到 Word 範本檔案 (`template.docx`)，請確認是否已經上傳至 GitHub"
+          " 專案根目錄！"
+      )
 
-        def get_cell_val(ws, coord):
-            val = ws[coord].value
-            if val is None:
-                return 0
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                return 0
+  if current_status != "已結案":
+    # ------------------------------------------
+    # 子功能 A：設定指標個案
+    # ------------------------------------------
+    st.markdown("---")
+    st.markdown("#### ⭐ 設定此事件的指標個案")
+    case_options = {}
+    for local_num, (idx, row) in enumerate(
+        df_current_event.iterrows(), start=1
+    ):
+      label = f"個案編號 {local_num}：{row['姓名']} ({row['身份證字號']})"
+      case_options[label] = idx
 
-        # 依檔名排序 (0601.xlsx, 0602.xlsx...)
-        sorted_files = sorted(uploaded_files, key=lambda x: x.name)
-        all_monthly_rows = []
+    selected_case_label = st.selectbox(
+        "選擇要設為指標個案的確診者",
+        list(case_options.keys()),
+        key="index_select",
+    )
 
-        with st.spinner("正在進行大數據解析與計算中..."):
-            for file_obj in sorted_files:
-                file_name = file_obj.name
-                
-                # 排除非預期的舊檔
-                if file_name.startswith('~$') or '彙總表' in file_name or '總表' in file_name:
-                    continue
-                    
-                wb = openpyxl.load_workbook(file_obj, data_only=True)
-                ws = wb.active
-                
-                row_data = {"日期/檔名": file_name}
-                daily_total_net = 0
-                
-                for col in target_cols:
-                    col_16 = get_cell_val(ws, f"{col}16")
-                    col_outs = sum(get_cell_val(ws, f"{col}{r}") for r in range(17, 23))
-                    net_val = col_16 - col_outs
-                    row_data[f"{col}欄_實際人數"] = int(net_val)
-                    daily_total_net += net_val
-                
-                row_data["全院合計實際人數"] = int(daily_total_net)
-                all_monthly_rows.append(row_data)
+    if st.button("🌟 確認將此人設為指標個案"):
+      target_idx = case_options[selected_case_label]
 
-        if not all_monthly_rows:
-            st.error("❌ 沒有找到有效的每日報表檔案，請確認檔名與格式！")
-        else:
-            df_summary = pd.DataFrame(all_monthly_rows)
+      df_logs["指標個案"] = df_logs["指標個案"].astype(str)
+      df_logs.loc[df_logs["事件名稱"] == selected_event, "指標個案"] = ""
+      df_logs.loc[target_idx, "指標個案"] = "⭐ 指標個案"
 
-            column_rename_map = {
-                "E欄_實際人數": "致中組_中一",
-                "F欄_實際人數": "致中組_中二",
-                "G欄_實際人數": "致中組_中三",
-                "I欄_實際人數": "致和組_三樓",
-                "J欄_實際人數": "致和組_四樓",
-                "M欄_實際人數": "保養組_1區",
-                "N欄_實際人數": "保養組_2區",
-                "O欄_實際人數": "保養組_3區",
-            }
-            df_summary.rename(columns=column_rename_map, inplace=True)
+      save_event_data(selected_event, df_logs)
+      st.success(
+          f"✨ 已成功指定【{selected_case_label}】為本群聚事件的指標個案，並同步至雲端分頁！"
+      )
+      st.rerun()
 
-            # 全月人日數加總
-            sum_row = {"日期/檔名": f"【{int(month_num)}月全月總人日數】"}
-            for col_name in df_summary.columns:
-                if col_name != "日期/檔名":
-                    sum_row[col_name] = df_summary[col_name].sum()
+    # ------------------------------------------
+    # 子功能 B：修改或刪除現有個案資料
+    # ------------------------------------------
+    st.markdown("---")
+    st.markdown("#### ✏️ 修改或刪除現有個案資料")
 
-            df_summary = pd.concat([df_summary, pd.DataFrame([sum_row])], ignore_index=True)
+    edit_options = {}
+    for local_num, (idx, row) in enumerate(df_current_event.iterrows(), start=1):
+      label = f"個案編號 {local_num}：{row['姓名']} ({row['身份證字號']})"
+      edit_options[label] = idx
 
-            # 4. 畫面上顯示成果
-            st.success("🎉 分析完成！")
-            st.subheader("📊 統計成果預覽 (含每日人數與全月人日數)")
-            st.dataframe(df_summary, use_container_width=True)
+    selected_edit_label = st.selectbox(
+        "選擇要修改或刪除的個案", list(edit_options.keys()), key="edit_select"
+    )
 
-            # 生成 Excel 下載檔
-            temp_dir = tempfile.mkdtemp()
-            out_file_path = os.path.join(temp_dir, f"{int(month_num)}月全院各區實際在院人數及人日數總彙總表.xlsx")
-            df_summary.to_excel(out_file_path, index=False)
+    if selected_edit_label:
+      target_idx = edit_options[selected_edit_label]
+      target_row = df_logs.loc[target_idx]
 
-            with open(out_file_path, "rb") as f:
-                st.download_button(
-                    label="📥 下載全月彙總 Excel 檔",
-                    data=f,
-                    file_name=f"{int(month_num)}月全院各區實際在院人數及人日數總彙總表.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+      with st.form("edit_case_form"):
+        st.markdown(
+            f"正在編輯：**{target_row['姓名']}** （身分證："
+            f"`{target_row['身份證字號']}`）"
+        )
+
+        try:
+          default_date = datetime.strptime(
+              str(target_row["發生日期"]), "%Y-%m-%d"
+          ).date()
+        except:
+          default_date = datetime.today().date()
+
+        edit_case_date = st.date_input("1. 發生日期", value=default_date)
+
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+          edit_name = st.text_input("2. 姓名", value=str(target_row["姓名"]))
+          genders = ["男", "女", "其他"]
+          current_g = str(target_row["性別"])
+          g_idx = genders.index(current_g) if current_g in genders else 0
+          edit_gender = st.selectbox("3. 性別", genders, index=g_idx)
+        with col_e2:
+          edit_birthday = st.text_input("4. 生日", value=str(target_row["生日"]))
+          edit_id = st.text_input(
+              "5. 身份證字號", value=str(target_row["身份證字號"])
+          )
+
+        edit_diag = st.text_input(
+            "6. 確診管道", value=str(target_row["確診管道"])
+        )
+        edit_follow = st.text_area(
+            "7. 後續處理", value=str(target_row["後續處理"])
+        )
+
+        col_sub1, col_sub2 = st.columns(2)
+        with col_sub1:
+          update_submitted = st.form_submit_button("💾 儲存修改至雲端分頁")
+        with col_sub2:
+          delete_submitted = st.form_submit_button(
+              "🗑️ 從雲端分頁刪除此個案"
+          )
+
+        if update_submitted:
+          if not edit_name or not edit_id:
+            st.warning("⚠️ 請務必填寫「姓名」與「身份證字號」！")
+          else:
+            df_logs.loc[target_idx, "發生日期"] = str(edit_case_date)
+            df_logs.loc[target_idx, "姓名"] = edit_name
+            df_logs.loc[target_idx, "性別"] = edit_gender
+            df_logs.loc[target_idx, "生日"] = edit_birthday
+            df_logs.loc[target_idx, "身份證字號"] = edit_id.upper()
+            df_logs.loc[target_idx, "確診管道"] = edit_diag
+            df_logs.loc[target_idx, "後續處理"] = edit_follow
+
+            save_event_data(selected_event, df_logs)
+            st.success(f"✨ 成功更新個案【{edit_name}】並同步至雲端分頁！")
+            st.rerun()
+
+        if delete_submitted:
+          deleted_name = target_row["姓名"]
+          deleted_id = target_row["身份證字號"]
+          df_logs = df_logs.drop(target_idx).reset_index(drop=True)
+          save_event_data(selected_event, df_logs)
+          st.success(f"🗑️ 已成功刪除個案【{deleted_name} ({deleted_id})】！")
+          st.rerun()
+
+  else:
+    st.info("🔒 此事件已結案，無法再變更或刪除個案。")
+
+else:
+  st.info(f"事件【{selected_event}】目前尚無個案紀錄！")
+
+# 管理員總表
+with st.expander("🔍 管理員視角：檢視所有事件的總合併日誌（雲端同步）"):
+  st.dataframe(df_logs, use_container_width=True)
